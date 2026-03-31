@@ -12,6 +12,8 @@ interface OdditySession {
   createdAt: number;
   treeContent?: string;
   essayContent?: string;
+  essayTabId?: string;
+  treeTabId?: string;
 }
 
 function sleep(ms: number) {
@@ -29,9 +31,11 @@ let textarea: HTMLTextAreaElement | null = null;
 let sendBtn: HTMLButtonElement | null = null;
 let treeBtn: HTMLButtonElement | null = null;
 let essayBtn: HTMLButtonElement | null = null;
-let pendingSuggestionMode = false;
 let activeDocId = '';
 let activeTabId = '';
+let essayTabId = '';
+let treeTabId = '';
+let pendingEditMode = false;
 let activeSession: OdditySession | null = null;
 
 // ─── URL parsing ──────────────────────────────────────────────────────────────
@@ -82,6 +86,7 @@ chrome.runtime.onMessage.addListener((message) => {
   } else if (message.type === 'STREAM_ERROR') {
     currentStreamText = '';
     streaming = false;
+    pendingEditMode = false;
     setInputEnabled(true);
   }
 });
@@ -214,11 +219,13 @@ async function buildEssayTab(essayContent: string): Promise<void> {
 
   await waitForTabChange(brainstormingTabId);
   const newTabId = new URLSearchParams(window.location.search).get('tab') ?? 'default';
+  essayTabId = newTabId;
 
   await renameGDocsTabWithRetry('Essay Draft', newTabId, 8, 300);
   await pasteIntoDoc(essayContent + '\n\n');
   if (activeSession) {
     activeSession.essayContent = essayContent;
+    activeSession.essayTabId = newTabId;
     await saveSession(activeSession);
   }
   await navigateToGDocsTabByLabel('Brainstorming');
@@ -235,11 +242,13 @@ async function buildArgumentTreeTab(treeContent: string): Promise<void> {
 
   await waitForTabChange(brainstormingTabId);
   const newTabId = new URLSearchParams(window.location.search).get('tab') ?? 'default';
+  treeTabId = newTabId;
 
   await renameGDocsTabWithRetry('Argument Tree', newTabId, 8, 300);
   await pasteIntoDoc(treeContent + '\n\n');
   if (activeSession) {
     activeSession.treeContent = treeContent;
+    activeSession.treeTabId = newTabId;
     await saveSession(activeSession);
   }
   // Navigate back to Brainstorming by its display name (set during activate)
@@ -253,29 +262,226 @@ function getCurrentGDocsTabLabel(): string {
 }
 
 async function enableSuggestionMode(): Promise<void> {
-  // No-op if already in suggesting mode
-  if (document.querySelector('[aria-label="Suggesting"], [data-tooltip="Suggesting"]')) return;
+  // No-op if already in suggesting mode — exclude menu items to avoid false positives
+  const suggestingIndicator = document.querySelector(
+    '[aria-label="Suggesting"]:not([role="menuitem"]):not([role="option"]), ' +
+    '[data-tooltip="Suggesting"]:not([role="menuitem"]):not([role="option"])'
+  );
+  if (suggestingIndicator) {
+    console.log('[Oddity] Already in suggestion mode, indicator:', suggestingIndicator.tagName, suggestingIndicator.getAttribute('aria-label'));
+    return;
+  }
+  console.log('[Oddity] Not in suggestion mode, attempting to enable...');
 
-  // Click the editing-mode button to open the mode picker
-  const editBtn = document.querySelector<HTMLElement>('[aria-label="Editing"], [data-tooltip="Editing"]');
-  if (!editBtn) return;
+  // Find the editing-mode button — try multiple selector variants
+  const editBtn = document.querySelector<HTMLElement>(
+    '[aria-label="Editing"], [aria-label="Editing mode"], [data-tooltip="Editing"], [data-tooltip="Editing mode"]'
+  ) ?? Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]')).find(el =>
+    /^editing$/i.test(el.textContent?.trim() ?? '') ||
+    /^editing$/i.test(el.getAttribute('aria-label') ?? '') ||
+    /^editing$/i.test(el.getAttribute('data-tooltip') ?? '')
+  );
+  console.log('[Oddity] Editing mode button found:', !!editBtn, editBtn?.getAttribute('aria-label'), editBtn?.textContent?.trim());
+  if (!editBtn) { console.warn('[Oddity] Editing mode button not found — suggestion mode skipped'); return; }
 
   editBtn.click();
-  await sleep(400);
 
-  // Click "Suggesting" in the dropdown
-  const menuItems = document.querySelectorAll<HTMLElement>('[role="menuitem"]');
-  for (const item of menuItems) {
-    if (/suggest/i.test(item.textContent ?? '') || /suggest/i.test(item.getAttribute('aria-label') ?? '')) {
+  // Poll for "Suggesting" menu item
+  const start = Date.now();
+  while (Date.now() - start < 2000) {
+    const item = Array.from(document.querySelectorAll<HTMLElement>('[role^="menuitem"], [role="option"]'))
+      .find(el => /\bsuggesting\b/i.test(el.textContent ?? '') || /\bsuggesting\b/i.test(el.getAttribute('aria-label') ?? ''));
+    if (item) {
+      console.log('[Oddity] Clicking Suggesting item:', item.textContent?.trim());
       item.click();
       await sleep(300);
       return;
     }
+    await sleep(50);
   }
+  console.warn('[Oddity] Suggesting menu item not found after 2s');
+}
+
+// ─── Find & replace helpers ───────────────────────────────────────────────────
+function parseEditOps(text: string): Array<{ find: string; replace: string }> {
+  const ops: Array<{ find: string; replace: string }> = [];
+  const blocks = text.split(/^---\s*$/m);
+  for (const block of blocks) {
+    const findMatch = block.match(/^FIND:\s*([\s\S]*?)(?=\nREPLACE:)/m);
+    const replaceMatch = block.match(/^REPLACE:\s*([\s\S]*)$/m);
+    if (findMatch) {
+      ops.push({
+        find: findMatch[1].trim(),
+        replace: replaceMatch ? replaceMatch[1].trim() : '',
+      });
+    }
+  }
+  return ops;
+}
+
+// Returns all accessible same-origin iframe documents
+function iframeDocuments(): Document[] {
+  return Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe'))
+    .flatMap(f => { try { return f.contentDocument ? [f.contentDocument] : []; } catch { return []; } });
+}
+
+// Find the F&R dialog inputs across all frames using multiple strategies
+function findFRInputs(): { findInput: HTMLInputElement | null; replaceInput: HTMLInputElement | null; dialogDoc: Document } {
+  const excluded = ['docs-title-input', 'docs-omnibox-input', 'assisted-actions-toolbar-omnibox', 'goog-toolbar-combo-button-input'];
+
+  for (const doc of [document, ...iframeDocuments()]) {
+    // Strategy 1: aria-label contains "find" or "search"
+    const allInputs = Array.from(doc.querySelectorAll<HTMLInputElement>('input'));
+    const findByLabel = allInputs.find(el => /\b(find|search)\b/i.test(el.getAttribute('aria-label') ?? ''));
+    if (findByLabel) {
+      const replaceByLabel = allInputs.find(el => /\breplace\b/i.test(el.getAttribute('aria-label') ?? '') && el !== findByLabel);
+      return { findInput: findByLabel, replaceInput: replaceByLabel ?? null, dialogDoc: doc };
+    }
+
+    // Strategy 2: [role="dialog"] container — grab its first two inputs
+    const dialog = doc.querySelector<HTMLElement>('[role="dialog"]');
+    if (dialog) {
+      const dialogInputs = Array.from(dialog.querySelectorAll<HTMLInputElement>('input'))
+        .filter(el => !excluded.some(c => el.classList.contains(c)));
+      if (dialogInputs.length >= 1) {
+        console.log('[Oddity] findFRInputs via dialog role, inputs found:', dialogInputs.length);
+        return { findInput: dialogInputs[0], replaceInput: dialogInputs[1] ?? null, dialogDoc: doc };
+      }
+    }
+
+    // Strategy 3: any non-toolbar inputs in this document (F&R dialog is the only dialog open)
+    const nonToolbarInputs = allInputs.filter(el => !excluded.some(c => el.classList.contains(c)));
+    if (nonToolbarInputs.length >= 1) {
+      console.log('[Oddity] findFRInputs via fallback, inputs:', nonToolbarInputs.map(el => el.getAttribute('aria-label') ?? el.className));
+      return { findInput: nonToolbarInputs[0], replaceInput: nonToolbarInputs[1] ?? null, dialogDoc: doc };
+    }
+  }
+  return { findInput: null, replaceInput: null, dialogDoc: document };
+}
+
+// Poll until F&R dialog inputs are available
+async function waitForFRDialog(timeoutMs = 3000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (findFRInputs().findInput) return true;
+    await sleep(100);
+  }
+  return false;
+}
+
+// Type into a Google Docs F&R input (Closure Library) char-by-char via keypress
+async function typeIntoFRInput(input: HTMLInputElement, value: string): Promise<void> {
+  input.focus();
+  await sleep(50);
+  // Clear existing content
+  input.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', keyCode: 65, ctrlKey: true, bubbles: true }));
+  input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', keyCode: 46, bubbles: true }));
+  input.value = '';
+  await sleep(50);
+  // Type each character so Closure's input handlers fire
+  for (const char of value) {
+    const cc = char.charCodeAt(0);
+    input.dispatchEvent(new KeyboardEvent('keypress', { key: char, charCode: cc, keyCode: cc, bubbles: true, cancelable: true }));
+    input.value += char;
+    input.dispatchEvent(new InputEvent('input', { data: char, inputType: 'insertText', bubbles: true }));
+  }
+  await sleep(400); // wait for Closure's debounce timer
+}
+
+// Core approach: open F&R → find text → select it in canvas → close dialog → type replacement
+// This is the ONLY path that produces real tracked-change suggestions (Find & Replace All bypasses suggestion mode).
+async function replaceTextViaCanvas(findText: string, replaceText: string): Promise<void> {
+  console.log('[Oddity] replaceTextViaCanvas', JSON.stringify(findText.slice(0, 40)), '→', JSON.stringify(replaceText.slice(0, 40)));
+
+  // 1. Open F&R via ⌘+Shift+H keyboard shortcut on the canvas iframe
+  // (Clicking the Edit menu item uses isTrusted:false which Google Docs ignores)
+  const canvasIframe = document.querySelector<HTMLIFrameElement>('.docs-texteventtarget-iframe');
+  if (!canvasIframe?.contentDocument?.body) { console.warn('[Oddity] Canvas iframe not found'); return; }
+  canvasIframe.contentDocument.body.focus();
+  await sleep(100);
+  canvasIframe.contentDocument.body.dispatchEvent(new KeyboardEvent('keydown', {
+    key: 'H', code: 'KeyH', keyCode: 72,
+    metaKey: true, shiftKey: true,
+    bubbles: true, cancelable: true,
+  }));
+  console.log('[Oddity] Dispatched ⌘+Shift+H to open F&R');
+
+  // 2. Poll for dialog to appear
+  const ready = await waitForFRDialog();
+  if (!ready) { console.warn('[Oddity] F&R dialog did not appear'); return; }
+
+  // 3. Find inputs by aria-label
+  const { findInput, dialogDoc } = findFRInputs();
+  if (!findInput) { console.warn('[Oddity] Find input not found'); return; }
+  console.log('[Oddity] findInput aria-label:', findInput.getAttribute('aria-label'));
+
+  // 4. Type find text into find input
+  await typeIntoFRInput(findInput, findText);
+
+  // 5. Click "Find" / "Next" button to select the occurrence in the canvas
+  function findNextBtn(): HTMLElement | null {
+    for (const doc of [document, ...iframeDocuments()]) {
+      const btn = Array.from(doc.querySelectorAll<HTMLElement>('*')).find(el =>
+        el.offsetParent !== null && el.children.length === 0 &&
+        /^(find|next)$/i.test(el.textContent?.trim() ?? '')
+      );
+      if (btn) return btn;
+    }
+    return null;
+  }
+  const nextBtn = findNextBtn();
+  console.log('[Oddity] Next btn found:', !!nextBtn, nextBtn?.textContent?.trim());
+  if (nextBtn) {
+    nextBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    nextBtn.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true }));
+    nextBtn.dispatchEvent(new MouseEvent('click',     { bubbles: true, cancelable: true }));
+    await sleep(300);
+  }
+
+  // 6. Close dialog — dispatch Escape to the find input itself so it bubbles up through the dialog
+  findInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
+  await sleep(100);
+  // Also try clicking the X close button if dialog is still open
+  const closeX = Array.from(document.querySelectorAll<HTMLElement>('*')).find(el =>
+    el.offsetParent !== null && /^(×|✕|close)$/i.test(el.textContent?.trim() ?? '') &&
+    (el.getAttribute('aria-label') ?? '').toLowerCase().includes('close')
+  );
+  if (closeX) closeX.click();
+  // Poll until dialog is gone (max 2s) before typing into canvas
+  const closeStart = Date.now();
+  while (Date.now() - closeStart < 2000) {
+    if (!findFRInputs().findInput) break;
+    await sleep(100);
+  }
+  await sleep(200);
+
+  // 7. Type replacement via canvas — overwrites the selection as a tracked-change suggestion
+  await pasteIntoDoc(replaceText);
+  await sleep(200);
 }
 
 // ─── Response router ──────────────────────────────────────────────────────────
 async function handleResponseActions(response: string): Promise<void> {
+  if (pendingEditMode) {
+    pendingEditMode = false;
+    console.log('[Oddity] handleResponseActions: edit mode, response length:', response.length, 'preview:', response.slice(0, 100));
+    const editMatch = response.match(/<<<EDIT>>>([\s\S]+?)<<<END_EDIT>>>/);
+    console.log('[Oddity] editMatch found:', !!editMatch);
+    if (editMatch) {
+      console.log('[Oddity] enabling suggestion mode...');
+      await enableSuggestionMode();
+      console.log('[Oddity] suggestion mode enabled, parsing ops...');
+      const ops = parseEditOps(editMatch[1].trim());
+      console.log('[Oddity] parsed ops:', ops.length, ops.map(o => ({ find: o.find.slice(0, 30), replace: o.replace.slice(0, 30) })));
+      for (const op of ops) {
+        await replaceTextViaCanvas(op.find, op.replace);
+      }
+    } else {
+      console.warn('[Oddity] No <<<EDIT>>> block found in response');
+    }
+    return;
+  }
+
   const treeMatch = response.match(/<<<TREE>>>([\s\S]+?)<<<END_TREE>>>/);
   const essayMatch = response.match(/<<<ESSAY>>>([\s\S]+?)<<<END_ESSAY>>>/);
   if (treeMatch) {
@@ -289,11 +495,7 @@ async function handleResponseActions(response: string): Promise<void> {
     await buildEssayTab(essayContent);
     if (followup) await pasteIntoDoc(`Oddity: ${followup}\n\n`);
   } else {
-    if (pendingSuggestionMode) {
-      await enableSuggestionMode();
-      pendingSuggestionMode = false;
-    }
-    await pasteIntoDoc(`${response}\n\n`);
+    await pasteIntoDoc(`Oddity: ${response}\n\n`);
   }
 }
 
@@ -331,7 +533,7 @@ function handleTreeRequest(btn: HTMLButtonElement) {
   messages.push(...history);
   messages.push({ role: 'user', content: 'Please build the argument tree now.' });
 
-  chrome.runtime.sendMessage({ type: 'CHAT', messages });
+  chrome.runtime.sendMessage({ type: 'CHAT', messages, mode: 'tree' });
 }
 
 // ─── Essay request ────────────────────────────────────────────────────────────
@@ -358,24 +560,53 @@ function handleEssayRequest(btn: HTMLButtonElement) {
   messages.push(...history);
   messages.push({ role: 'user', content: 'Please write a first draft essay based on our conversation and the argument tree.' });
 
-  chrome.runtime.sendMessage({ type: 'CHAT', messages });
+  chrome.runtime.sendMessage({ type: 'CHAT', messages, mode: 'essay' });
 }
 
 // ─── Send handler ─────────────────────────────────────────────────────────────
-function handleSend(text: string) {
+async function handleSend(text: string) {
   if (!text || streaming) return;
+
+  const currentTabId = new URLSearchParams(window.location.search).get('tab') ?? 'default';
+  const isEditTab = (!!essayTabId && currentTabId === essayTabId) || (!!treeTabId && currentTabId === treeTabId);
+
+  if (isEditTab) {
+    // On edit tabs: send to AI with edit prompt, paste response as suggestion, no user echo
+    streaming = true;
+    pendingEditMode = true;
+    pendingUserPaste = Promise.resolve();
+    setInputEnabled(false);
+    if (textarea) textarea.placeholder = 'Editing…';
+
+    history.push({ role: 'user', content: text });
+    saveSessionAfterMessage();
+
+    // Use stored essay content — scraping is unreliable due to isTrusted blocks
+    const essayContent = activeSession?.essayContent ?? '';
+    console.log('[Oddity] essayContent length:', essayContent.length, 'preview:', essayContent.slice(0, 100));
+
+    const editMessages: Message[] = [];
+    if (essayContent) {
+      editMessages.push({
+        role: 'user',
+        content: `Here is the essay to edit:\n\n${essayContent}\n\nNow let's begin.`,
+      });
+      editMessages.push({
+        role: 'assistant',
+        content: "Got it — I've read the essay. What edits would you like me to make?",
+      });
+    }
+    editMessages.push(...history);
+
+    chrome.runtime.sendMessage({ type: 'CHAT', messages: editMessages, mode: 'edit' });
+    return;
+  }
+
+  // Brainstorming tab: normal chat flow
   streaming = true;
   pendingUserText = text;
   setInputEnabled(false);
-
-  const onEssayTab = getCurrentGDocsTabLabel() === 'Essay Draft';
-  if (onEssayTab) {
-    // On Essay Draft tab: don't echo into the essay; AI response will be a suggestion
-    pendingUserPaste = Promise.resolve();
-    pendingSuggestionMode = true;
-  } else {
-    pendingUserPaste = pasteIntoDoc(`You: ${text}\n\n`);
-  }
+  pendingUserPaste = pasteIntoDoc(`You: ${text}\n\n`);
 
   history.push({ role: 'user', content: text });
   saveSessionAfterMessage(); // fire-and-forget
@@ -393,7 +624,7 @@ function handleSend(text: string) {
   }
   messages.push(...history);
 
-  chrome.runtime.sendMessage({ type: 'CHAT', messages });
+  chrome.runtime.sendMessage({ type: 'CHAT', messages, mode: 'chat' });
 }
 
 // ─── Input bar ────────────────────────────────────────────────────────────────
@@ -586,6 +817,8 @@ async function activate() {
   if (existingSession) {
     history.push(...existingSession.history);
     activeSession = existingSession;
+    essayTabId = existingSession.essayTabId ?? '';
+    treeTabId = existingSession.treeTabId ?? '';
     await pasteIntoDoc('Oddity: [Resuming — Brainstorming]\n\n');
   } else {
     activeSession = { docId, tabId, history: [], createdAt: Date.now() };
@@ -610,6 +843,9 @@ function deactivate() {
   docContext = '';
   activeDocId = '';
   activeTabId = '';
+  essayTabId = '';
+  treeTabId = '';
+  pendingEditMode = false;
   activeSession = null;
   const fab = document.getElementById('oddity-fab') as HTMLButtonElement | null;
   if (fab) fab.style.display = 'flex';

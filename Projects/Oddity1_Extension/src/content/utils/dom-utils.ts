@@ -7,53 +7,17 @@ function sleep(ms: number): Promise<void> {
  * Simulates Ctrl+A then Ctrl+C and reads the clipboard result.
  */
 export async function scrapeDocContext(): Promise<string> {
-  const scrollY = window.scrollY;
-
-  // Focus the Google Docs editor body so keyboard events land there
-  const editorBody =
-    (document.querySelector('.kix-appview-editor') as HTMLElement | null) ??
-    (document.querySelector('[contenteditable="true"]') as HTMLElement | null);
-
-  if (editorBody) {
-    editorBody.focus();
+  // Read text directly from kix render spans — no keyboard events needed
+  const paragraphs = Array.from(document.querySelectorAll<HTMLElement>('.kix-paragraphrenderer'));
+  if (paragraphs.length > 0) {
+    return paragraphs.map(p => {
+      const spans = Array.from(p.querySelectorAll<HTMLElement>('.kix-lineview-text-block'));
+      return spans.map(s => s.textContent ?? '').join('');
+    }).join('\n');
   }
-
-  await sleep(50);
-
-  // Simulate Ctrl+A
-  document.dispatchEvent(
-    new KeyboardEvent('keydown', {
-      key: 'a',
-      code: 'KeyA',
-      ctrlKey: true,
-      bubbles: true,
-      cancelable: true,
-    })
-  );
-  await sleep(150);
-
-  // Simulate Ctrl+C
-  document.dispatchEvent(
-    new KeyboardEvent('keydown', {
-      key: 'c',
-      code: 'KeyC',
-      ctrlKey: true,
-      bubbles: true,
-      cancelable: true,
-    })
-  );
-  await sleep(250);
-
-  let text = '';
-  try {
-    text = await navigator.clipboard.readText();
-  } catch {
-    // clipboard API may be blocked; return empty string gracefully
-    text = '';
-  }
-
-  window.scrollTo({ top: scrollY, behavior: 'instant' });
-  return text;
+  // Fallback: grab all text blocks directly
+  const blocks = Array.from(document.querySelectorAll<HTMLElement>('.kix-lineview-text-block'));
+  return blocks.map(b => b.textContent ?? '').join('\n');
 }
 
 /**

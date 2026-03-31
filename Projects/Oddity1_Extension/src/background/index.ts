@@ -1,5 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import systemPrompt from '../../SYSTEM_PROMPT.md?raw';
+import essayPrompt from '../../ESSAY_PROMPT.md?raw';
+import treePrompt from '../../TREE_PROMPT.md?raw';
+import editPrompt from '../../EDIT_PROMPT.md?raw';
 
 const API_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY as string;
 
@@ -11,6 +14,7 @@ interface ChatMessage {
 interface ChatRequest {
   type: 'CHAT';
   messages: ChatMessage[];
+  mode?: 'chat' | 'essay' | 'tree' | 'edit';
 }
 
 chrome.runtime.onMessage.addListener((request: ChatRequest, sender, sendResponse) => {
@@ -21,12 +25,14 @@ chrome.runtime.onMessage.addListener((request: ChatRequest, sender, sendResponse
 
   (async () => {
     const client = new Anthropic({ apiKey: API_KEY, dangerouslyAllowBrowser: true });
+    const promptMap: Record<string, string> = { essay: essayPrompt, tree: treePrompt, edit: editPrompt };
+    const prompt = promptMap[request.mode ?? ''] ?? systemPrompt;
 
     try {
       const stream = client.messages.stream({
         model: 'claude-sonnet-4-6',
         max_tokens: 2048,
-        system: systemPrompt,
+        system: prompt,
         messages: request.messages,
       });
 

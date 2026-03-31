@@ -10,6 +10,8 @@ interface OdditySession {
   tabId: string;
   history: Message[];
   createdAt: number;
+  treeContent?: string;
+  essayContent?: string;
 }
 
 function sleep(ms: number) {
@@ -25,6 +27,9 @@ let pendingUserPaste: Promise<void> = Promise.resolve();
 let inputBar: HTMLDivElement | null = null;
 let textarea: HTMLTextAreaElement | null = null;
 let sendBtn: HTMLButtonElement | null = null;
+let treeBtn: HTMLButtonElement | null = null;
+let essayBtn: HTMLButtonElement | null = null;
+let pendingSuggestionMode = false;
 let activeDocId = '';
 let activeTabId = '';
 let activeSession: OdditySession | null = null;
@@ -131,50 +136,39 @@ async function pasteIntoDoc(text: string) {
 }
 
 // ─── GDocs tab rename ─────────────────────────────────────────────────────────
-function findGDocsTabElement(tabId: string): Element | null {
-  // Tier 1: exact match by data-tab-id attribute
-  if (tabId !== 'default') {
-    const byAttr = document.querySelector(`[data-tab-id="${tabId}"]`);
-    if (byAttr) return byAttr;
-  }
-  // Tier 2: ARIA selected tab
-  const byAria = document.querySelector('[role="tab"][aria-selected="true"]');
-  if (byAria) return byAria;
-  // Tier 3: GDocs class name
-  return document.querySelector('.docs-tabs-tab-selected');
-}
+// GDocs tabs use role="treeitem" (not "tab") with aria-selected="true" for active tab.
+// The label text is in .chapter-label-content; the rename input is input.goog-control
+// inside the same treeitem, hidden until double-click activates rename mode.
 
-async function renameGDocsTab(name: string, tabId: string): Promise<boolean> {
-  const tabEl = findGDocsTabElement(tabId);
+async function renameGDocsTab(name: string): Promise<boolean> {
+  const tabEl = document.querySelector('[role="treeitem"][aria-selected="true"]');
   if (!tabEl) return false;
 
-  tabEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
-  await sleep(300);
+  // Double-click the visible label to activate rename mode
+  const labelEl = tabEl.querySelector('.chapter-label-content');
+  if (!labelEl) return false;
 
-  const inputEl =
-    document.querySelector<HTMLInputElement>('.docs-tabs-tab-name-input') ??
-    document.querySelector<HTMLInputElement>('[aria-label*="tab name" i]') ??
-    (document.activeElement?.tagName === 'INPUT' ? document.activeElement as HTMLInputElement : null);
+  labelEl.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+  await sleep(400);
 
-  if (!inputEl) return false;
+  // The rename input lives inside the tab element, becomes visible after dblclick
+  const inputEl = tabEl.querySelector<HTMLInputElement>('input.goog-control');
+  if (!inputEl || inputEl.style.display === 'none') return false;
 
-  inputEl.select();
-  inputEl.value = '';
-  for (const char of name) {
-    inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
-    inputEl.value += char;
-    inputEl.dispatchEvent(new InputEvent('input', { bubbles: true, data: char, inputType: 'insertText' }));
-    await sleep(20);
-  }
+  inputEl.value = name;
+  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+  await sleep(50);
+
   inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-  await sleep(100);
+  inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+  await sleep(200);
   return true;
 }
 
-async function renameGDocsTabWithRetry(name: string, tabId: string, maxAttempts = 5, delayMs = 400): Promise<void> {
+async function renameGDocsTabWithRetry(name: string, tabId: string, maxAttempts = 5, delayMs = 500): Promise<void> {
   if (tabId === 'default') return;
   for (let i = 0; i < maxAttempts; i++) {
-    const ok = await renameGDocsTab(name, tabId);
+    const ok = await renameGDocsTab(name);
     if (ok) return;
     await sleep(delayMs);
   }
@@ -183,10 +177,8 @@ async function renameGDocsTabWithRetry(name: string, tabId: string, maxAttempts 
 
 // ─── GDocs tab creation & navigation ─────────────────────────────────────────
 async function createNewGDocsTab(): Promise<boolean> {
-  const addBtn =
-    document.querySelector<HTMLElement>('[aria-label="Add tab"]') ??
-    document.querySelector<HTMLElement>('[data-tooltip*="Add tab"]') ??
-    document.querySelector<HTMLElement>('.docs-tabs-add-tab');
+  // aria-label="Add tab" confirmed from live DOM inspection
+  const addBtn = document.querySelector<HTMLElement>('[aria-label="Add tab"]');
   if (!addBtn) return false;
   addBtn.click();
   await sleep(600);
@@ -202,13 +194,34 @@ async function waitForTabChange(previousTabId: string, timeout = 3000): Promise<
   }
 }
 
-async function navigateToGDocsTab(tabId: string): Promise<void> {
-  if (tabId === 'default') return;
-  const tabEl = findGDocsTabElement(tabId);
+// Navigate to a tab by its display name (aria-label on the treeitem)
+async function navigateToGDocsTabByLabel(label: string): Promise<void> {
+  const tabEl = document.querySelector<HTMLElement>(`[role="treeitem"][aria-label="${label}"]`);
   if (tabEl) {
-    (tabEl as HTMLElement).click();
+    tabEl.click();
     await sleep(400);
   }
+}
+
+async function buildEssayTab(essayContent: string): Promise<void> {
+  const brainstormingTabId = activeTabId;
+
+  const created = await createNewGDocsTab();
+  if (!created) {
+    await pasteIntoDoc(`\n\n--- Essay Draft ---\n${essayContent}\n\n`);
+    return;
+  }
+
+  await waitForTabChange(brainstormingTabId);
+  const newTabId = new URLSearchParams(window.location.search).get('tab') ?? 'default';
+
+  await renameGDocsTabWithRetry('Essay Draft', newTabId, 8, 300);
+  await pasteIntoDoc(essayContent + '\n\n');
+  if (activeSession) {
+    activeSession.essayContent = essayContent;
+    await saveSession(activeSession);
+  }
+  await navigateToGDocsTabByLabel('Brainstorming');
 }
 
 async function buildArgumentTreeTab(treeContent: string): Promise<void> {
@@ -225,19 +238,62 @@ async function buildArgumentTreeTab(treeContent: string): Promise<void> {
 
   await renameGDocsTabWithRetry('Argument Tree', newTabId, 8, 300);
   await pasteIntoDoc(treeContent + '\n\n');
-  await navigateToGDocsTab(brainstormingTabId);
+  if (activeSession) {
+    activeSession.treeContent = treeContent;
+    await saveSession(activeSession);
+  }
+  // Navigate back to Brainstorming by its display name (set during activate)
+  await navigateToGDocsTabByLabel('Brainstorming');
+}
+
+// ─── Suggestion mode helpers ──────────────────────────────────────────────────
+function getCurrentGDocsTabLabel(): string {
+  const activeTab = document.querySelector('[role="treeitem"][aria-selected="true"] .chapter-label-content');
+  return activeTab?.textContent?.trim() ?? '';
+}
+
+async function enableSuggestionMode(): Promise<void> {
+  // No-op if already in suggesting mode
+  if (document.querySelector('[aria-label="Suggesting"], [data-tooltip="Suggesting"]')) return;
+
+  // Click the editing-mode button to open the mode picker
+  const editBtn = document.querySelector<HTMLElement>('[aria-label="Editing"], [data-tooltip="Editing"]');
+  if (!editBtn) return;
+
+  editBtn.click();
+  await sleep(400);
+
+  // Click "Suggesting" in the dropdown
+  const menuItems = document.querySelectorAll<HTMLElement>('[role="menuitem"]');
+  for (const item of menuItems) {
+    if (/suggest/i.test(item.textContent ?? '') || /suggest/i.test(item.getAttribute('aria-label') ?? '')) {
+      item.click();
+      await sleep(300);
+      return;
+    }
+  }
 }
 
 // ─── Response router ──────────────────────────────────────────────────────────
 async function handleResponseActions(response: string): Promise<void> {
   const treeMatch = response.match(/<<<TREE>>>([\s\S]+?)<<<END_TREE>>>/);
+  const essayMatch = response.match(/<<<ESSAY>>>([\s\S]+?)<<<END_ESSAY>>>/);
   if (treeMatch) {
     const treeContent = treeMatch[1].trim();
     const followup = response.replace(/<<<TREE>>>[\s\S]+?<<<END_TREE>>>/, '').trim();
     await buildArgumentTreeTab(treeContent);
     if (followup) await pasteIntoDoc(`Oddity: ${followup}\n\n`);
+  } else if (essayMatch) {
+    const essayContent = essayMatch[1].trim();
+    const followup = response.replace(/<<<ESSAY>>>[\s\S]+?<<<END_ESSAY>>>/, '').trim();
+    await buildEssayTab(essayContent);
+    if (followup) await pasteIntoDoc(`Oddity: ${followup}\n\n`);
   } else {
-    await pasteIntoDoc(`Oddity: ${response}\n\n`);
+    if (pendingSuggestionMode) {
+      await enableSuggestionMode();
+      pendingSuggestionMode = false;
+    }
+    await pasteIntoDoc(`${response}\n\n`);
   }
 }
 
@@ -248,6 +304,61 @@ function setInputEnabled(enabled: boolean) {
     if (enabled) textarea.focus();
   }
   if (sendBtn) sendBtn.disabled = !enabled;
+  if (treeBtn) treeBtn.disabled = !enabled;
+  if (essayBtn) essayBtn.disabled = !enabled;
+}
+
+// ─── Tree request ─────────────────────────────────────────────────────────────
+function handleTreeRequest(btn: HTMLButtonElement) {
+  if (streaming || history.length === 0) return;
+  streaming = true;
+  pendingUserPaste = Promise.resolve(); // no user text to paste into doc
+  btn.disabled = true;
+  if (sendBtn) sendBtn.disabled = true;
+  if (textarea) { textarea.disabled = true; textarea.placeholder = 'Building tree…'; }
+
+  const messages: Message[] = [];
+  if (docContext) {
+    messages.push({
+      role: 'user',
+      content: `Here is the current document text for context:\n\n${docContext}\n\nNow let's begin.`,
+    });
+    messages.push({
+      role: 'assistant',
+      content: "Got it — I've read the document. What would you like to think through?",
+    });
+  }
+  messages.push(...history);
+  messages.push({ role: 'user', content: 'Please build the argument tree now.' });
+
+  chrome.runtime.sendMessage({ type: 'CHAT', messages });
+}
+
+// ─── Essay request ────────────────────────────────────────────────────────────
+function handleEssayRequest(btn: HTMLButtonElement) {
+  if (streaming || history.length === 0) return;
+  streaming = true;
+  pendingUserPaste = Promise.resolve();
+  btn.disabled = true;
+  if (sendBtn) sendBtn.disabled = true;
+  if (treeBtn) treeBtn.disabled = true;
+  if (textarea) { textarea.disabled = true; textarea.placeholder = 'Drafting essay…'; }
+
+  const messages: Message[] = [];
+  if (docContext) {
+    messages.push({
+      role: 'user',
+      content: `Here is the current document text for context:\n\n${docContext}\n\nNow let's begin.`,
+    });
+    messages.push({
+      role: 'assistant',
+      content: "Got it — I've read the document. What would you like to think through?",
+    });
+  }
+  messages.push(...history);
+  messages.push({ role: 'user', content: 'Please write a first draft essay based on our conversation and the argument tree.' });
+
+  chrome.runtime.sendMessage({ type: 'CHAT', messages });
 }
 
 // ─── Send handler ─────────────────────────────────────────────────────────────
@@ -257,8 +368,14 @@ function handleSend(text: string) {
   pendingUserText = text;
   setInputEnabled(false);
 
-  // Immediately inject the user's message into the doc
-  pendingUserPaste = pasteIntoDoc(`You: ${text}\n\n`);
+  const onEssayTab = getCurrentGDocsTabLabel() === 'Essay Draft';
+  if (onEssayTab) {
+    // On Essay Draft tab: don't echo into the essay; AI response will be a suggestion
+    pendingUserPaste = Promise.resolve();
+    pendingSuggestionMode = true;
+  } else {
+    pendingUserPaste = pasteIntoDoc(`You: ${text}\n\n`);
+  }
 
   history.push({ role: 'user', content: text });
   saveSessionAfterMessage(); // fire-and-forget
@@ -351,6 +468,40 @@ function createInputBar() {
       padding: 0;
     }
     .close:hover { color: #6b7280; }
+    .tree-btn {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      border: none;
+      background: #f3f4f6;
+      color: #374151;
+      font-size: 16px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: background 0.15s;
+    }
+    .tree-btn:hover { background: #e5e7eb; }
+    .tree-btn:disabled { opacity: 0.4; cursor: default; }
+    .essay-btn {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      border: none;
+      background: #f3f4f6;
+      color: #374151;
+      font-size: 16px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: background 0.15s;
+    }
+    .essay-btn:hover { background: #e5e7eb; }
+    .essay-btn:disabled { opacity: 0.4; cursor: default; }
   `;
   shadow.appendChild(style);
 
@@ -388,6 +539,18 @@ function createInputBar() {
     }
   });
 
+  treeBtn = document.createElement('button');
+  treeBtn.className = 'tree-btn';
+  treeBtn.textContent = '🌳';
+  treeBtn.title = 'Build argument tree';
+  treeBtn.addEventListener('click', () => handleTreeRequest(treeBtn!));
+
+  essayBtn = document.createElement('button');
+  essayBtn.className = 'essay-btn';
+  essayBtn.textContent = '📝';
+  essayBtn.title = 'Draft essay from conversation';
+  essayBtn.addEventListener('click', () => handleEssayRequest(essayBtn!));
+
   const closeBtn = document.createElement('button');
   closeBtn.className = 'close';
   closeBtn.textContent = '×';
@@ -395,6 +558,8 @@ function createInputBar() {
   closeBtn.addEventListener('click', deactivate);
 
   bar.appendChild(textarea);
+  bar.appendChild(treeBtn);
+  bar.appendChild(essayBtn);
   bar.appendChild(sendBtn);
   bar.appendChild(closeBtn);
   shadow.appendChild(bar);
@@ -438,6 +603,8 @@ function deactivate() {
     inputBar = null;
     textarea = null;
     sendBtn = null;
+    treeBtn = null;
+    essayBtn = null;
   }
   history.length = 0;
   docContext = '';
